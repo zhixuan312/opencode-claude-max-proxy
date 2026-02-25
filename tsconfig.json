@@ -2,12 +2,10 @@
   "compilerOptions": {
     "lib": ["ESNext"],
     "target": "ESNext",
-    "module": "Preserve",
+    "module": "NodeNext",
     "moduleDetection": "force",
-    "jsx": "react-jsx",
     "allowJs": true,
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
+    "moduleResolution": "NodeNext",
     "verbatimModuleSyntax": true,
     "noEmit": true,
     "strict": true,
@@ -19,6 +17,6 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["src/**/*", "index.ts", "provider.ts", "tests/**/*"],
+  "include": ["src/**/*", "bin/**/*"],
   "exclude": ["node_modules", "dist"]
 }
