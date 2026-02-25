@@ -88,6 +88,9 @@ function formatMessages(messages: any[]): string {
 }
 
 function buildPrompt(body: any): string {
+  const messages: any[] = body.messages || []
+
+  // Extract system prompt
   let systemContext = ""
   if (body.system) {
     if (typeof body.system === "string") {
@@ -107,9 +110,39 @@ function buildPrompt(body: any): string {
     systemContext += `\n\nAvailable tools:\n${toolDefs}`
   }
 
-  const conversation = body.messages?.length ? formatMessages(body.messages) : ""
+  // Put conversation history (all but last message) into system context
+  // Send only the last user message as the prompt
+  const history = messages.slice(0, -1)
+  const lastMessage = messages[messages.length - 1]
 
-  return systemContext ? `${systemContext}\n\n${conversation}` : conversation
+  if (history.length > 0) {
+    const historyText = formatMessages(history)
+    systemContext += `\n\n<conversation_history>\n${historyText}\n</conversation_history>`
+  }
+
+  // Extract the last message text as the actual prompt
+  let prompt = ""
+  if (lastMessage) {
+    if (typeof lastMessage.content === "string") {
+      prompt = lastMessage.content
+    } else if (Array.isArray(lastMessage.content)) {
+      prompt = lastMessage.content
+        .map((block: any) => {
+          if (block.type === "text") return block.text
+          if (block.type === "tool_result") {
+            const content = typeof block.content === "string"
+              ? block.content
+              : block.content?.map((b: any) => b.text).join("") || ""
+            return `[Tool Result (${block.tool_use_id}): ${content}]`
+          }
+          return ""
+        }).filter(Boolean).join("\n")
+    } else {
+      prompt = String(lastMessage.content)
+    }
+  }
+
+  return systemContext ? `${systemContext}\n\n${prompt}` : prompt
 }
 
 // --- Server ---
