@@ -178,27 +178,77 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               catch { clearInterval(heartbeat) }
             }, 15_000)
 
+            // The SDK emits multiple message cycles during internal tool loops.
+            // We merge them into a single SSE lifecycle for the client:
+            // one message_start, sequential text blocks, one message_delta + message_stop.
+            let messageSent = false
+            let nextBlockIndex = 0
+            const skipIndices = new Set<number>()
+            const indexMap = new Map<number, number>()
+
+            const emit = (type: string, data: any) => {
+              controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`))
+            }
+
             try {
               for await (const msg of response) {
                 if (msg.type !== "stream_event") continue
                 const event = msg.event
                 const eventType = event.type
+                const origIndex = (event as any).index as number | undefined
 
-                if (eventType === "message_delta") {
-                  const patched = {
-                    ...event,
-                    delta: { ...((event as any).delta || {}), stop_reason: "end_turn" },
-                    usage: (event as any).usage || { output_tokens: 0 },
+                // Send message_start only once (first turn)
+                if (eventType === "message_start") {
+                  if (!messageSent) {
+                    emit(eventType, event)
+                    messageSent = true
                   }
-                  controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(patched)}\n\n`))
+                  // Reset per-turn tracking
+                  skipIndices.clear()
+                  indexMap.clear()
                   continue
                 }
 
-                controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`))
+                // Suppress intermediate message_delta and message_stop
+                if (eventType === "message_delta" || eventType === "message_stop") {
+                  continue
+                }
+
+                // Filter tool_use blocks, re-index text blocks
+                if (eventType === "content_block_start") {
+                  const block = (event as any).content_block
+                  if (block?.type === "tool_use") {
+                    if (origIndex !== undefined) skipIndices.add(origIndex)
+                    continue
+                  }
+                  const newIndex = nextBlockIndex++
+                  if (origIndex !== undefined) indexMap.set(origIndex, newIndex)
+                  emit(eventType, { ...event, index: newIndex })
+                  continue
+                }
+
+                if (eventType === "content_block_delta" || eventType === "content_block_stop") {
+                  if (origIndex !== undefined && skipIndices.has(origIndex)) continue
+                  const newIndex = origIndex !== undefined ? indexMap.get(origIndex) : undefined
+                  if (newIndex === undefined) continue
+                  emit(eventType, { ...event, index: newIndex })
+                  continue
+                }
+
+                // Forward anything else as-is
+                emit(eventType, event)
               }
             } finally {
               clearInterval(heartbeat)
             }
+
+            // Close the single message lifecycle
+            emit("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn" },
+              usage: { output_tokens: 0 },
+            })
+            emit("message_stop", { type: "message_stop" })
 
             controller.close()
           } catch (error) {
