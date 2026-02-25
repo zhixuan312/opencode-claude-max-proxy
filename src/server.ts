@@ -172,8 +172,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         maxTurns: 100,
         model,
         pathToClaudeCodeExecutable: claudeExecutable,
-        permissionMode: "bypassPermissions" as const,
-        allowDangerouslySkipPermissions: true,
+        permissionMode: "acceptEdits" as const,
+        allowedTools: [
+          "Bash", "Read", "Write", "Edit", "MultiEdit",
+          "Glob", "Grep", "NotebookEdit",
+          "WebFetch", "WebSearch",
+          "Task", "TaskOutput", "TodoWrite",
+        ],
       }
 
       if (!stream) {
