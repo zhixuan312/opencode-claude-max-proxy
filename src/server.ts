@@ -62,6 +62,14 @@ function mapModel(model: string): "sonnet" | "opus" | "haiku" {
   return "sonnet"
 }
 
+// Truncate long tool results to prevent Claude from echoing raw data
+const MAX_TOOL_RESULT_LENGTH = 1500
+
+function truncateToolResult(content: string): string {
+  if (content.length <= MAX_TOOL_RESULT_LENGTH) return content
+  return content.slice(0, MAX_TOOL_RESULT_LENGTH) + "\n... [truncated]"
+}
+
 function formatMessages(messages: any[]): string {
   return messages.map(m => {
     const role = m.role === "assistant" ? "Assistant" : "Human"
@@ -69,28 +77,34 @@ function formatMessages(messages: any[]): string {
       return `${role}: ${m.content}`
     }
     if (Array.isArray(m.content)) {
-      const parts = m.content.map((block: any) => {
-        if (block.type === "text") return block.text
-        if (block.type === "tool_use") {
-          return `[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`
-        }
-        if (block.type === "tool_result") {
-          const content = typeof block.content === "string"
+      const textParts: string[] = []
+      const toolParts: string[] = []
+
+      for (const block of m.content) {
+        if (block.type === "text") {
+          textParts.push(block.text)
+        } else if (block.type === "tool_use") {
+          toolParts.push(`<tool_use name="${block.name}" id="${block.id}">\n${JSON.stringify(block.input)}\n</tool_use>`)
+        } else if (block.type === "tool_result") {
+          const raw = typeof block.content === "string"
             ? block.content
             : block.content?.map((b: any) => b.text).join("") || ""
-          return `[Tool Result (${block.tool_use_id}): ${content}]`
-        }
-        if (block.type === "image") {
+          toolParts.push(`<tool_result id="${block.tool_use_id}">\n${truncateToolResult(raw)}\n</tool_result>`)
+        } else if (block.type === "image") {
           log("warn: image block dropped (not supported through SDK string prompt)")
-          return "[Image content not supported through proxy]"
+        } else if (block.type === "thinking") {
+          // skip thinking from history
         }
-        if (block.type === "thinking") return "" // skip thinking from history
-        return ""
-      }).filter(Boolean)
-      return `${role}: ${parts.join("\n")}`
+      }
+
+      const parts: string[] = []
+      if (textParts.length) parts.push(textParts.join("\n"))
+      if (toolParts.length) parts.push(`<internal_tool_interactions>\n${toolParts.join("\n")}\n</internal_tool_interactions>`)
+
+      return parts.length ? `${role}: ${parts.join("\n")}` : ""
     }
     return `${role}: ${String(m.content)}`
-  }).join("\n\n")
+  }).filter(Boolean).join("\n\n")
 }
 
 // Extract token usage from SDK result — handles both camelCase (SDK) and snake_case (API)
@@ -170,6 +184,9 @@ function extractSystemPrompt(body: any, includeTools = true): string {
     systemContext += `\n\nAvailable tools:\n${toolDefs}`
   }
 
+  // Instruct Claude to never echo internal tool data in its response
+  systemContext += `\n\nIMPORTANT: The conversation history may contain <internal_tool_interactions>, <tool_use>, and <tool_result> XML tags. These are internal metadata. NEVER reproduce, quote, or reference the raw content of these tags in your response. Only use the information within them to inform your answer. Your response should contain only the final answer text and tool_use blocks — never raw tool result data.`
+
   return systemContext
 }
 
@@ -191,22 +208,24 @@ function buildPrompt(body: any): string {
     if (typeof lastMessage.content === "string") {
       parts.push(lastMessage.content)
     } else if (Array.isArray(lastMessage.content)) {
-      const text = lastMessage.content
-        .map((block: any) => {
-          if (block.type === "text") return block.text
-          if (block.type === "tool_result") {
-            const content = typeof block.content === "string"
-              ? block.content
-              : block.content?.map((b: any) => b.text).join("") || ""
-            return `[Tool Result (${block.tool_use_id}): ${content}]`
-          }
-          if (block.type === "image") {
-            log("warn: image block in prompt dropped")
-            return "[Image content not supported through proxy]"
-          }
-          return ""
-        }).filter(Boolean).join("\n")
-      parts.push(text)
+      const textParts: string[] = []
+      const toolParts: string[] = []
+
+      for (const block of lastMessage.content) {
+        if (block.type === "text") {
+          textParts.push(block.text)
+        } else if (block.type === "tool_result") {
+          const raw = typeof block.content === "string"
+            ? block.content
+            : block.content?.map((b: any) => b.text).join("") || ""
+          toolParts.push(`<tool_result id="${block.tool_use_id}">\n${truncateToolResult(raw)}\n</tool_result>`)
+        } else if (block.type === "image") {
+          log("warn: image block in prompt dropped")
+        }
+      }
+
+      if (textParts.length) parts.push(textParts.join("\n"))
+      if (toolParts.length) parts.push(`<internal_tool_interactions>\n${toolParts.join("\n")}\n</internal_tool_interactions>`)
     } else {
       parts.push(String(lastMessage.content))
     }
