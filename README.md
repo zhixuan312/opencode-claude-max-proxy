@@ -1,60 +1,102 @@
-# opencode-claude-max-proxy
+# openclaw-claude-max-proxy
 
-[![npm version](https://img.shields.io/npm/v/opencode-claude-max-proxy.svg)](https://www.npmjs.com/package/opencode-claude-max-proxy)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub stars](https://img.shields.io/github/stars/rynfar/opencode-claude-max-proxy.svg)](https://github.com/rynfar/opencode-claude-max-proxy/stargazers)
+Use your **Claude Max subscription** with [OpenClaw](https://github.com/openclaw) (Telegram bot) — or any client that speaks the Anthropic Messages API.
 
-Use your **Claude Max subscription** with OpenCode.
+Forked from [rynfar/opencode-claude-max-proxy](https://github.com/rynfar/opencode-claude-max-proxy) and rewritten for OpenClaw's tool-calling workflow.
 
-## The Problem
+## Why This Exists
 
-Anthropic doesn't allow Claude Max subscribers to use their subscription with third-party tools like OpenCode. If you want to use Claude in OpenCode, you have to pay for API access separately - even though you're already paying for "unlimited" Claude.
+Anthropic doesn't let Claude Max subscribers use their subscription through the standard API. The only programmatic access is through the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)'s `query()` function, which spawns a Claude Code CLI process under the hood.
 
-Your options are:
-1. Use Claude's official apps only (limited to their UI)
-2. Pay again for API access on top of your Max subscription
-3. **Use this proxy**
+This proxy translates Anthropic Messages API requests into SDK `query()` calls, so any client (OpenClaw, OpenCode, etc.) can use your Max subscription at zero additional cost.
 
-## The Solution
+## What Changed From the Original Fork
 
-This proxy bridges the gap using Anthropic's own tools:
+The original proxy (rynfar v1.0.2) was a proof-of-concept that worked for basic text chat but broke down with tool-calling clients like OpenClaw. This fork is a complete rewrite of the proxy logic.
+
+### Architecture Change
 
 ```
-OpenCode → Proxy (localhost:3456) → Claude Agent SDK → Your Claude Max Subscription
+ORIGINAL (v1.0.2):
+  Client → proxy → query(maxTurns:100, bypassPermissions)
+                     ↓
+             SDK runs internal 100-turn agent loop
+             tool_use blocks FILTERED OUT (never reach client)
+             stop_reason HARDCODED "end_turn"
+             usage HARDCODED { input_tokens: 0, output_tokens: 0 }
+             system prompt CRAMMED into user message
+                     ↓
+             Only text blocks returned to client
+
+THIS FORK:
+  Client → proxy → query(maxTurns:1, tools:[], mcpServers:{bridge})
+                     ↓
+             SDK makes ONE API call
+             ALL content blocks forwarded (text, tool_use, thinking)
+             Real stop_reason ("end_turn" or "tool_use")
+             Real token usage from SDK
+                     ↓
+  Client receives tool_use → executes tools → sends new request → repeat
 ```
 
-The [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) is Anthropic's **official npm package** that lets developers build with Claude using their Max subscription. This proxy simply translates OpenCode's API requests into SDK calls.
+### Detailed Delta
 
-**Your Max subscription. Anthropic's official SDK. Zero additional cost.**
+| Area | Original (rynfar v1.0.2) | This Fork |
+|------|--------------------------|-----------|
+| **Runtime** | Bun | Node.js + tsx |
+| **SDK version** | `^0.2.0` | `^0.2.62` |
+| **Dependencies** | hono | hono, @hono/node-server, zod 4 |
+| **File structure** | `src/proxy/server.ts`, `src/proxy/types.ts`, `src/logger.ts` | Single `src/server.ts` |
+| **Tool support** | None. Tools ignored. | MCP bridge — client tools registered as in-process MCP server via `createSdkMcpServer()` |
+| **tool_use blocks** | Filtered out, never forwarded | Forwarded with MCP prefix stripped (`mcp__proxy-tools__` → plain name) |
+| **stop_reason** | Always hardcoded `"end_turn"` | Real value from SDK (`"end_turn"` or `"tool_use"`) |
+| **Token usage** | Hardcoded `{ input_tokens: 0, output_tokens: 0 }` | Real usage extracted from SDK result message |
+| **System prompt** | Crammed into user message alongside history | Passed via SDK `systemPrompt` option (separate from prompt) |
+| **Conversation history** | Flattened into same string as system prompt | Wrapped in `<conversation_history>` tags in prompt, separated from system |
+| **Thinking/reasoning** | Not supported | Passthrough — `thinking` config forwarded, thinking blocks included in response |
+| **maxTurns** | `100` (SDK runs its own agent loop) | `1` (single API round-trip, client controls the loop) |
+| **Permissions** | None set (SDK default) | `tools: []` disables built-in tools, `canUseTool` deny-all prevents execution |
+| **Session persistence** | SDK default (may persist) | `persistSession: false` (stateless, matches client's history-in-every-request pattern) |
+| **Streaming** | Manually constructs SSE envelope, emits one text block from final result | Forwards raw SDK stream events directly, only patches missing lifecycle events |
+| **Image blocks** | Silently dropped | Logged warning + placeholder text |
+| **Error handling** | Basic | Graceful MCP fallback — if tool server creation fails, falls back to text-only mode |
 
-## Is This Allowed?
+## How It Works
 
-**Yes.** Here's why:
+```
+OpenClaw sends request with tools: [web_search, browse, ...]
+                    ↓
+Proxy creates in-process MCP server from tool definitions
+  (each tool gets a permissive zod schema + stub handler)
+                    ↓
+Proxy calls SDK query() with:
+  - prompt: conversation history + last message
+  - systemPrompt: extracted system instructions
+  - tools: [] (no built-in Claude Code tools)
+  - mcpServers: { "proxy-tools": <MCP server> }
+  - maxTurns: 1 (single API round-trip)
+  - canUseTool: deny-all (prevent any tool execution)
+  - thinking: passthrough from client config
+                    ↓
+SDK streams response events to proxy
+  - Proxy strips MCP prefix from tool names
+  - Forwards all content blocks (text, tool_use, thinking)
+  - Emits real stop_reason and token usage
+                    ↓
+Client receives tool_use blocks
+  → executes tools itself
+  → sends new request with tool_result
+  → cycle repeats until done
+```
 
-| Concern | Reality |
-|---------|---------|
-| "Bypassing restrictions" | No. We use Anthropic's public SDK exactly as documented |
-| "Violating TOS" | No. The SDK is designed for programmatic Claude access |
-| "Unauthorized access" | No. You authenticate with `claude login` using your own account |
-| "Reverse engineering" | No. We call `query()` from their npm package, that's it |
-
-The Claude Agent SDK exists specifically to let Max subscribers use Claude programmatically. We're just translating the request format so OpenCode can use it.
-
-**~200 lines of TypeScript. No hacks. No magic. Just format translation.**
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **Zero API costs** | Uses your Claude Max subscription, not per-token billing |
-| **Full compatibility** | Works with any Anthropic model in OpenCode |
-| **Streaming support** | Real-time SSE streaming just like the real API |
-| **Auto-start** | Optional launchd service for macOS |
-| **Simple setup** | Two commands to get running |
+The proxy never executes tools. Three layers prevent it:
+1. `tools: []` — no built-in Claude Code tools registered
+2. `canUseTool` callback — returns deny for any tool call
+3. `maxTurns: 1` — SDK won't loop back even if a tool somehow ran
 
 ## Prerequisites
 
-1. **Claude Max subscription** - [Subscribe here](https://claude.ai/settings/subscription)
+1. **Claude Max subscription** — [Subscribe here](https://claude.ai/settings/subscription)
 
 2. **Claude CLI** installed and authenticated:
    ```bash
@@ -62,17 +104,14 @@ The Claude Agent SDK exists specifically to let Max subscribers use Claude progr
    claude login
    ```
 
-3. **Bun** runtime:
-   ```bash
-   curl -fsSL https://bun.sh/install | bash
-   ```
+3. **Node.js** >= 18
 
 ## Installation
 
 ```bash
-git clone https://github.com/rynfar/opencode-claude-max-proxy
+git clone https://github.com/zhixuan312/opencode-claude-max-proxy
 cd opencode-claude-max-proxy
-bun install
+npm install
 ```
 
 ## Usage
@@ -80,121 +119,88 @@ bun install
 ### Start the Proxy
 
 ```bash
-bun run proxy
+npm start
 ```
 
-### Run OpenCode
+The proxy prints its config on startup. Default: `http://127.0.0.1:3456`.
+
+### Configure OpenClaw
+
+Add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "models": {
+    "providers": {
+      "claude-proxy": {
+        "baseUrl": "http://127.0.0.1:3456",
+        "apiKey": "dummy",
+        "api": "anthropic-messages",
+        "models": [
+          { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" },
+          { "id": "claude-opus-4-6", "name": "Claude Opus 4.6" },
+          { "id": "claude-haiku-4-5", "name": "Claude Haiku 4.5" }
+        ]
+      }
+    }
+  }
+}
+```
+
+### Use With Other Clients
+
+Any client that speaks the Anthropic Messages API works:
 
 ```bash
-ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://127.0.0.1:3456 opencode
+ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://127.0.0.1:3456 <your-client>
 ```
 
-Select any `anthropic/claude-*` model (opus, sonnet, haiku).
-
-### One-liner
+### Debug Mode
 
 ```bash
-bun run proxy & ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://127.0.0.1:3456 opencode
+CLAUDE_PROXY_DEBUG=1 npm start
 ```
-
-## Auto-start on macOS
-
-Set up the proxy to run automatically on login:
-
-```bash
-cat > ~/Library/LaunchAgents/com.claude-max-proxy.plist << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude-max-proxy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$(which bun)</string>
-        <string>run</string>
-        <string>proxy</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>$(pwd)</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
-```
-
-Then add an alias to `~/.zshrc`:
-
-```bash
-echo "alias oc='ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://127.0.0.1:3456 opencode'" >> ~/.zshrc
-source ~/.zshrc
-```
-
-Now just run `oc` to start OpenCode with Claude Max.
-
-## Model Mapping
-
-| OpenCode Model | Claude SDK |
-|----------------|------------|
-| `anthropic/claude-opus-*` | opus |
-| `anthropic/claude-sonnet-*` | sonnet |
-| `anthropic/claude-haiku-*` | haiku |
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `CLAUDE_PROXY_PORT` | 3456 | Proxy server port |
-| `CLAUDE_PROXY_HOST` | 127.0.0.1 | Proxy server host |
+| `CLAUDE_PROXY_PORT` | `3456` | Proxy server port |
+| `CLAUDE_PROXY_HOST` | `127.0.0.1` | Proxy server host |
+| `CLAUDE_PROXY_DEBUG` | `0` | Enable debug logging |
 
-## How It Works
+## Known Limitations
 
-1. **OpenCode** sends a request to `http://127.0.0.1:3456/messages` (thinking it's the Anthropic API)
-2. **Proxy** receives the request and extracts the messages
-3. **Proxy** calls `query()` from the Claude Agent SDK with your prompt
-4. **Claude Agent SDK** authenticates using your Claude CLI login (tied to your Max subscription)
-5. **Claude** processes the request using your subscription
-6. **Proxy** streams the response back in Anthropic SSE format
-7. **OpenCode** receives the response as if it came from the real API
+These are SDK architectural ceilings — not fixable without bypassing the SDK (which isn't possible with Max subscriptions):
 
-The proxy is ~200 lines of TypeScript. No magic, no hacks.
+| Limitation | Reason |
+|-----------|--------|
+| **No prompt caching** | SDK doesn't expose `cache_control` |
+| **No vision/images** | SDK `prompt` is a string, can't pass image content blocks |
+| **History flattened to text** | Conversation history serialized as `[Tool Call: ...]` / `[Tool Result: ...]` text, not structured API messages |
+| **No full Anthropic API parity** | Always going through the SDK translation layer |
 
 ## FAQ
 
-### Why do I need `ANTHROPIC_API_KEY=dummy`?
+### Why not use the Anthropic API directly?
 
-OpenCode requires an API key to be set, but we never actually use it. The Claude Agent SDK handles authentication through your Claude CLI login. Any non-empty string works.
+Claude Max subscription tokens only work through the Claude Agent SDK's `query()` function. There's no way to use them with the standard Anthropic API.
 
-### Does this work with other tools besides OpenCode?
+### Why `ANTHROPIC_API_KEY=dummy`?
 
-Yes! Any tool that uses the Anthropic API format can use this proxy. Just point `ANTHROPIC_BASE_URL` to `http://127.0.0.1:3456`.
+Most clients require an API key to be set. The proxy never uses it — the SDK authenticates through your Claude CLI login. Any non-empty string works.
+
+### Why fork instead of contributing upstream?
+
+The original was designed for OpenCode (a coding IDE). This fork is rewritten for OpenClaw (a Telegram bot) with fundamentally different requirements: tool-calling passthrough, real token usage, thinking support. The architecture changed completely.
 
 ### What about rate limits?
 
-Your Claude Max subscription has its own usage limits. This proxy doesn't add any additional limits.
+Your Claude Max subscription has its own usage limits. The proxy doesn't add any.
 
 ### Is my data sent anywhere else?
 
-No. The proxy runs locally on your machine. Your requests go directly to Claude through the official SDK.
-
-## Troubleshooting
-
-### "Authentication failed"
-
-Run `claude login` to authenticate with the Claude CLI.
-
-### "Connection refused"
-
-Make sure the proxy is running: `bun run proxy`
-
-### Proxy keeps dying
-
-Use the launchd service (see Auto-start section) which automatically restarts the proxy.
+No. The proxy runs on your machine. Requests go directly to Claude through the official SDK.
 
 ## License
 
@@ -202,4 +208,5 @@ MIT
 
 ## Credits
 
-Built with the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) by Anthropic.
+- Original proxy by [rynfar](https://github.com/rynfar/opencode-claude-max-proxy)
+- Built with the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) by Anthropic
