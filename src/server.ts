@@ -1,7 +1,8 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { serve } from "@hono/node-server"
-import { query } from "@anthropic-ai/claude-agent-sdk"
+import { query, createSdkMcpServer, tool as sdkTool } from "@anthropic-ai/claude-agent-sdk"
+import { z } from "zod/v4"
 import type { Context } from "hono"
 import { execSync } from "child_process"
 import { existsSync } from "fs"
@@ -79,6 +80,11 @@ function formatMessages(messages: any[]): string {
             : block.content?.map((b: any) => b.text).join("") || ""
           return `[Tool Result (${block.tool_use_id}): ${content}]`
         }
+        if (block.type === "image") {
+          log("warn: image block dropped (not supported through SDK string prompt)")
+          return "[Image content not supported through proxy]"
+        }
+        if (block.type === "thinking") return "" // skip thinking from history
         return ""
       }).filter(Boolean)
       return `${role}: ${parts.join("\n")}`
@@ -87,10 +93,63 @@ function formatMessages(messages: any[]): string {
   }).join("\n\n")
 }
 
-function buildPrompt(body: any): string {
-  const messages: any[] = body.messages || []
+// Extract token usage from SDK result — handles both camelCase (SDK) and snake_case (API)
+function normalizeUsage(usage: any): { input_tokens: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
+  if (!usage) return { input_tokens: 0, output_tokens: 0 }
+  return {
+    input_tokens: usage.input_tokens ?? usage.inputTokens ?? 0,
+    output_tokens: usage.output_tokens ?? usage.outputTokens ?? 0,
+    ...(usage.cache_creation_input_tokens || usage.cacheCreationInputTokens
+      ? { cache_creation_input_tokens: usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens ?? 0 }
+      : {}),
+    ...(usage.cache_read_input_tokens || usage.cacheReadInputTokens
+      ? { cache_read_input_tokens: usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? 0 }
+      : {}),
+  }
+}
 
-  // Extract system prompt
+// SDK namespaces MCP tools as "mcp__<server>__<tool>". We need to strip this
+// prefix so OpenClaw receives plain tool names it recognizes.
+const MCP_SERVER_NAME = "proxy-tools"
+const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`
+
+function stripMcpPrefix(name: string): string {
+  return name.startsWith(MCP_PREFIX) ? name.slice(MCP_PREFIX.length) : name
+}
+
+// Create MCP tool server from client's tool definitions
+function createToolServer(tools: any[]): ReturnType<typeof createSdkMcpServer> | null {
+  if (!tools?.length) return null
+
+  try {
+    const mcpTools = tools.map((t: any) => {
+      const properties = t.input_schema?.properties || {}
+      const zodShape: Record<string, z.ZodType> = {}
+      for (const key of Object.keys(properties)) {
+        zodShape[key] = z.any()
+      }
+
+      return sdkTool(
+        t.name,
+        t.description || t.name,
+        zodShape,
+        async () => ({
+          content: [{ type: "text" as const, text: "Tool execution denied by proxy" }],
+        })
+      )
+    })
+
+    return createSdkMcpServer({ name: MCP_SERVER_NAME, tools: mcpTools })
+  } catch (error) {
+    log("warn: MCP tool server creation failed", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return null
+  }
+}
+
+// Extract system prompt from request body — passed separately via SDK systemPrompt option
+function extractSystemPrompt(body: any, includeTools = true): string {
   let systemContext = ""
   if (body.system) {
     if (typeof body.system === "string") {
@@ -103,30 +162,36 @@ function buildPrompt(body: any): string {
     }
   }
 
-  if (body.tools?.length) {
+  // Only include tools as text if MCP bridge is not available (fallback mode)
+  if (includeTools && body.tools?.length) {
     const toolDefs = body.tools.map((t: any) =>
       `- ${t.name}: ${t.description} (params: ${JSON.stringify(t.input_schema?.properties || {})})`
     ).join("\n")
     systemContext += `\n\nAvailable tools:\n${toolDefs}`
   }
 
-  // Put conversation history (all but last message) into system context
-  // Send only the last user message as the prompt
+  return systemContext
+}
+
+// Build the user prompt — history as context, last message as the actual prompt
+function buildPrompt(body: any): string {
+  const messages: any[] = body.messages || []
   const history = messages.slice(0, -1)
   const lastMessage = messages[messages.length - 1]
 
+  const parts: string[] = []
+
   if (history.length > 0) {
     const historyText = formatMessages(history)
-    systemContext += `\n\n<conversation_history>\n${historyText}\n</conversation_history>`
+    parts.push(`<conversation_history>\n${historyText}\n</conversation_history>`)
   }
 
   // Extract the last message text as the actual prompt
-  let prompt = ""
   if (lastMessage) {
     if (typeof lastMessage.content === "string") {
-      prompt = lastMessage.content
+      parts.push(lastMessage.content)
     } else if (Array.isArray(lastMessage.content)) {
-      prompt = lastMessage.content
+      const text = lastMessage.content
         .map((block: any) => {
           if (block.type === "text") return block.text
           if (block.type === "tool_result") {
@@ -135,14 +200,19 @@ function buildPrompt(body: any): string {
               : block.content?.map((b: any) => b.text).join("") || ""
             return `[Tool Result (${block.tool_use_id}): ${content}]`
           }
+          if (block.type === "image") {
+            log("warn: image block in prompt dropped")
+            return "[Image content not supported through proxy]"
+          }
           return ""
         }).filter(Boolean).join("\n")
+      parts.push(text)
     } else {
-      prompt = String(lastMessage.content)
+      parts.push(String(lastMessage.content))
     }
   }
 
-  return systemContext ? `${systemContext}\n\n${prompt}` : prompt
+  return parts.join("\n\n")
 }
 
 // --- Server ---
@@ -164,41 +234,97 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const body = await c.req.json()
       const model = mapModel(body.model || "sonnet")
       const stream = body.stream ?? true
+      const toolServer = createToolServer(body.tools)
+      const systemPrompt = extractSystemPrompt(body, /* includeTools */ !toolServer)
       const prompt = buildPrompt(body)
 
-      log("request", { model, stream, messages: body.messages?.length })
+      log("request", { model, stream, messages: body.messages?.length, hasMcpTools: !!toolServer })
 
-      const baseOptions = {
-        maxTurns: 100,
+      const baseOptions: Record<string, any> = {
+        maxTurns: 1,
         model,
         pathToClaudeCodeExecutable: claudeExecutable,
-        permissionMode: "bypassPermissions" as const,
-        allowDangerouslySkipPermissions: true,
+        tools: [],
+        canUseTool: async () => ({
+          behavior: "deny" as const,
+          message: "Tool execution denied by proxy",
+        }),
+        persistSession: false,
+      }
+
+      // Pass system prompt via SDK option instead of cramming into prompt
+      if (systemPrompt) {
+        baseOptions.systemPrompt = systemPrompt
+      }
+
+      // Register client tools as MCP server
+      if (toolServer) {
+        baseOptions.mcpServers = { "proxy-tools": toolServer }
+      }
+
+      // Pass through thinking/reasoning config if client requests it
+      if (body.thinking) {
+        if (body.thinking.type === "enabled" && body.thinking.budget_tokens) {
+          baseOptions.thinking = { type: "enabled", budgetTokens: body.thinking.budget_tokens }
+        } else {
+          baseOptions.thinking = body.thinking
+        }
       }
 
       if (!stream) {
-        let text = ""
+        const content: any[] = []
+        let resultUsage: any = null
+        let stopReason = "end_turn"
+
         for await (const msg of query({ prompt, options: baseOptions })) {
           if (msg.type === "assistant") {
             for (const block of msg.message.content) {
-              if (block.type === "text") text += block.text
+              if (block.type === "text") {
+                content.push({ type: "text", text: block.text })
+              } else if (block.type === "tool_use") {
+                content.push({
+                  type: "tool_use",
+                  id: (block as any).id,
+                  name: stripMcpPrefix((block as any).name),
+                  input: (block as any).input,
+                })
+              } else if ((block as any).type === "thinking") {
+                content.push({
+                  type: "thinking",
+                  thinking: (block as any).thinking,
+                })
+              }
+            }
+            if ((msg.message as any).stop_reason) {
+              stopReason = (msg.message as any).stop_reason
             }
           }
+          if (msg.type === "result") {
+            resultUsage = (msg as any).usage
+            if ((msg as any).stop_reason) {
+              stopReason = (msg as any).stop_reason
+            }
+          }
+        }
+
+        if (content.length === 0) {
+          content.push({ type: "text", text: "Could you provide more details?" })
         }
 
         return c.json({
           id: `msg_${Date.now()}`,
           type: "message",
           role: "assistant",
-          content: [{ type: "text", text: text || "Could you provide more details?" }],
+          content,
           model: body.model || "claude-sonnet-4-6",
-          stop_reason: "end_turn",
+          stop_reason: stopReason,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: normalizeUsage(resultUsage),
         })
       }
 
-      // Streaming
+      // Streaming — with maxTurns: 1, there is exactly one message lifecycle.
+      // Forward all SDK stream events directly to the client.
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
@@ -213,13 +339,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               catch { clearInterval(heartbeat) }
             }, 15_000)
 
-            // The SDK emits multiple message cycles during internal tool loops.
-            // We merge them into a single SSE lifecycle for the client:
-            // one message_start, sequential text blocks, one message_delta + message_stop.
-            let messageSent = false
-            let nextBlockIndex = 0
-            const skipIndices = new Set<number>()
-            const indexMap = new Map<number, number>()
+            let resultUsage: any = null
+            let sawMessageDelta = false
+            let sawMessageStop = false
+            let lastStopReason: string | null = null
 
             const emit = (type: string, data: any) => {
               controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`))
@@ -227,63 +350,55 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             try {
               for await (const msg of response) {
+                if (msg.type === "result") {
+                  resultUsage = (msg as any).usage
+                  continue
+                }
+
                 if (msg.type !== "stream_event") continue
                 const event = msg.event
                 const eventType = event.type
-                const origIndex = (event as any).index as number | undefined
 
-                // Send message_start only once (first turn)
-                if (eventType === "message_start") {
-                  if (!messageSent) {
-                    emit(eventType, event)
-                    messageSent = true
+                if (eventType === "message_delta") {
+                  sawMessageDelta = true
+                  lastStopReason = (event as any).delta?.stop_reason || null
+                }
+                if (eventType === "message_stop") {
+                  sawMessageStop = true
+                }
+
+                // Strip MCP prefix from tool_use names so client sees plain names
+                if (eventType === "content_block_start" && (event as any).content_block?.type === "tool_use") {
+                  const patched = {
+                    ...event,
+                    content_block: {
+                      ...(event as any).content_block,
+                      name: stripMcpPrefix((event as any).content_block.name),
+                    },
                   }
-                  // Reset per-turn tracking
-                  skipIndices.clear()
-                  indexMap.clear()
+                  emit(eventType, patched)
                   continue
                 }
 
-                // Suppress intermediate message_delta and message_stop
-                if (eventType === "message_delta" || eventType === "message_stop") {
-                  continue
-                }
-
-                // Filter tool_use blocks, re-index text blocks
-                if (eventType === "content_block_start") {
-                  const block = (event as any).content_block
-                  if (block?.type === "tool_use") {
-                    if (origIndex !== undefined) skipIndices.add(origIndex)
-                    continue
-                  }
-                  const newIndex = nextBlockIndex++
-                  if (origIndex !== undefined) indexMap.set(origIndex, newIndex)
-                  emit(eventType, { ...event, index: newIndex })
-                  continue
-                }
-
-                if (eventType === "content_block_delta" || eventType === "content_block_stop") {
-                  if (origIndex !== undefined && skipIndices.has(origIndex)) continue
-                  const newIndex = origIndex !== undefined ? indexMap.get(origIndex) : undefined
-                  if (newIndex === undefined) continue
-                  emit(eventType, { ...event, index: newIndex })
-                  continue
-                }
-
-                // Forward anything else as-is
+                // Forward all other events as-is
                 emit(eventType, event)
               }
             } finally {
               clearInterval(heartbeat)
             }
 
-            // Close the single message lifecycle
-            emit("message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: "end_turn" },
-              usage: { output_tokens: 0 },
-            })
-            emit("message_stop", { type: "message_stop" })
+            // Emit missing lifecycle events if SDK suppressed them
+            if (!sawMessageDelta) {
+              const usage = normalizeUsage(resultUsage)
+              emit("message_delta", {
+                type: "message_delta",
+                delta: { stop_reason: lastStopReason || "end_turn" },
+                usage,
+              })
+            }
+            if (!sawMessageStop) {
+              emit("message_stop", { type: "message_stop" })
+            }
 
             controller.close()
           } catch (error) {
